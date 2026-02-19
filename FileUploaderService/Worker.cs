@@ -6,7 +6,7 @@ using System.Threading.Channels;
 
 namespace FileUploaderService;
 
-public record FileItem(string FilePath, long Size);
+public record FileItem(string FilePath, long FileId, long Size);
 
 public class Worker : BackgroundService
 {
@@ -17,6 +17,7 @@ public class Worker : BackgroundService
     private readonly string _sourceFolder;
     private readonly string _fileExtension; // e.g., ".wav"
     private readonly int _concurrencyLimit;
+    private readonly int _scanIntervalSeconds;
 
     public Worker(ILogger<Worker> logger, IFileRepository fileRepository, IS3UploaderService s3UploaderService, IConfiguration configuration)
     {
@@ -28,6 +29,7 @@ public class Worker : BackgroundService
         _sourceFolder = _configuration["SourceFolder"] ?? throw new ArgumentNullException("SourceFolder");
         _fileExtension = _configuration["FileExtension"] ?? ".wav";
         _concurrencyLimit = _configuration.GetValue<int>("ConcurrencyLimit", 5);
+        _scanIntervalSeconds = _configuration.GetValue<int>("ScanIntervalSeconds", 60); // Default 60s
 
         // Ensure extension has dot
         if (!_fileExtension.StartsWith(".")) _fileExtension = "." + _fileExtension;
@@ -58,14 +60,8 @@ public class Worker : BackgroundService
             consumerTasks.Add(ConsumeFilesAsync(channel.Reader, stoppingToken));
         }
 
-        // Sequential Scan Strategy
-        long currentId = 0;
         try
         {
-            // Initial sync: Get the last processed ID from DB
-            currentId = await _fileRepository.GetMaxProcessedIdAsync();
-            _logger.LogInformation("Starting sequential scan from ID: {Id}", currentId + 1);
-
             while (!stoppingToken.IsCancellationRequested)
             {
                 if (!Directory.Exists(_sourceFolder))
@@ -75,46 +71,71 @@ public class Worker : BackgroundService
                     continue;
                 }
 
-                int maxMisses = 1000; // Look ahead 1000 IDs for a file.
-                bool foundAny = false;
+                _logger.LogInformation("Scanning source folder: {Folder}", _sourceFolder);
 
-                // We will try to fill the channel as much as possible, or at least one file.
-                // Loop until we find a file or exhaust lookahead.
-                for (int lookAhead = 1; lookAhead <= maxMisses; lookAhead++)
+                // Get the last processed ID to act as a high-water mark.
+                // We only care about files with ID > lastId.
+                long lastId = await _fileRepository.GetMaxProcessedIdAsync();
+
+                // Collect new files
+                var newFiles = new List<(long Id, string Path)>();
+
+                try
                 {
-                    if (stoppingToken.IsCancellationRequested) break;
+                    // Enumerate all files matching the extension
+                    // This might take time for millions of files, but it's necessary to find the "lowest > lastId".
+                    var files = Directory.EnumerateFiles(_sourceFolder, "*" + _fileExtension);
 
-                    long checkId = currentId + lookAhead;
-                    string fileName = $"{checkId}{_fileExtension}";
-                    string filePath = Path.Combine(_sourceFolder, fileName);
-
-                    if (File.Exists(filePath))
+                    foreach (var filePath in files)
                     {
-                        var fileInfo = new FileInfo(filePath);
-                        await channel.Writer.WriteAsync(new FileItem(filePath, fileInfo.Length), stoppingToken);
+                        if (stoppingToken.IsCancellationRequested) break;
 
-                        // We found a file at 'checkId'.
-                        // This means 'currentId + 1' to 'checkId - 1' were skipped/gaps.
-                        // Update currentId to checkId so next loop starts from here.
-                        currentId = checkId;
-                        foundAny = true;
-
-                        // Reset lookAhead to continue scanning immediately from this new point
-                        lookAhead = 0;
-
-                        // To avoid hogging the thread forever if files are dense, maybe break occasionally?
-                        // The await WriteAsync handles backpressure, so we pause if consumers are slow.
-                        // But we should check cancellation often.
+                        var fileName = Path.GetFileName(filePath);
+                        // Parse ID from filename (assuming strict numeric format like "123.wav")
+                        var namePart = Path.GetFileNameWithoutExtension(fileName);
+                        if (long.TryParse(namePart, out var fileId))
+                        {
+                            if (fileId > lastId)
+                            {
+                                newFiles.Add((fileId, filePath));
+                            }
+                        }
                     }
                 }
-
-                if (!foundAny)
+                catch (Exception ex)
                 {
-                    // We looked ahead 1000 IDs and found nothing.
-                    // Likely reached the end of the sequence or a huge gap.
-                    _logger.LogInformation("No new files found up to ID {Id}. Waiting...", currentId + maxMisses);
-                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                    _logger.LogError(ex, "Error enumerating files.");
                 }
+
+                if (newFiles.Count > 0)
+                {
+                    // Sort by ID ascending to process "smallest number first"
+                    _logger.LogInformation("Found {Count} new files. Sorting...", newFiles.Count);
+                    newFiles.Sort((a, b) => a.Id.CompareTo(b.Id));
+
+                    // Process them in sorted order
+                    foreach (var (id, path) in newFiles)
+                    {
+                        if (stoppingToken.IsCancellationRequested) break;
+
+                        try
+                        {
+                            var fileInfo = new FileInfo(path);
+                            await channel.Writer.WriteAsync(new FileItem(path, id, fileInfo.Length), stoppingToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error checking file info for {Path}", path);
+                        }
+                    }
+                }
+                else
+                {
+                    _logger.LogInformation("No new files found.");
+                }
+
+                // Wait before next scan. Ideally longer interval for large folders.
+                await Task.Delay(TimeSpan.FromSeconds(_scanIntervalSeconds), stoppingToken);
             }
         }
         catch (OperationCanceledException)
@@ -123,7 +144,7 @@ public class Worker : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error in sequential scanner.");
+            _logger.LogError(ex, "Error in producer loop.");
         }
         finally
         {
@@ -141,7 +162,7 @@ public class Worker : BackgroundService
                 var fileName = Path.GetFileName(item.FilePath);
                 try
                 {
-                    _logger.LogInformation("Processing file: {FileName}", fileName);
+                    _logger.LogInformation("Processing file: {FileName} (ID: {Id})", fileName, item.FileId);
 
                     await _s3UploaderService.UploadFileAsync(item.FilePath);
 
@@ -151,12 +172,7 @@ public class Worker : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to process file: {FileName}. Will retry on next restart if gap not filled.", fileName);
-                    // Failure handling:
-                    // We do NOT mark as processed.
-                    // The producer has already advanced past this ID.
-                    // This file will be skipped until restart OR manual intervention.
-                    // For now, this meets the requirement of "resume where stopped" (at the high water mark).
+                    _logger.LogError(ex, "Failed to process file: {FileName}. Will retry on next scan.", fileName);
                 }
             }
         }

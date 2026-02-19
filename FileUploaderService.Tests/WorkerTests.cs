@@ -32,7 +32,7 @@ public class WorkerTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_Should_Process_New_Files_Sequentially()
+    public async Task Worker_Should_Process_Files_In_Numeric_Order_Handling_Gaps()
     {
         // Arrange
         var loggerMock = new Mock<ILogger<Worker>>();
@@ -41,8 +41,9 @@ public class WorkerTests : IDisposable
 
         var inMemorySettings = new Dictionary<string, string> {
             {"SourceFolder", _testDir},
-            {"FileExtension", ".txt"}, // using .txt for test, but sequential check expects ID
-            {"ConcurrencyLimit", "2"},
+            {"FileExtension", ".txt"},
+            {"ConcurrencyLimit", "1"}, // Use 1 to verify order strictly
+            {"ScanIntervalSeconds", "1"}
         };
 
         IConfiguration configuration = new ConfigurationBuilder()
@@ -50,51 +51,64 @@ public class WorkerTests : IDisposable
             .Build();
 
         // Setup Repo
-        // Starting at ID 0, so next check is 1.txt
+        long maxId = 0; // State variable for mock
+
         repoMock.Setup(r => r.GetMaxProcessedIdAsync())
-            .ReturnsAsync(0);
+            .ReturnsAsync(() => maxId); // Use delegate to return current state
 
         repoMock.Setup(r => r.InitializeDatabaseAsync())
             .Returns(Task.CompletedTask);
 
+        // When MarkFileProcessedAsync is called, update maxId if the file ID is higher.
+        // But we need to parse it. The mock can just assume.
         repoMock.Setup(r => r.MarkFileProcessedAsync(It.IsAny<string>(), It.IsAny<long>(), It.IsAny<string>()))
+            .Callback<string, long, string>((fileName, size, status) => {
+                var namePart = Path.GetFileNameWithoutExtension(fileName);
+                if (long.TryParse(namePart, out var id))
+                {
+                    if (id > maxId) maxId = id;
+                }
+            })
             .Returns(Task.CompletedTask);
 
+        var uploadedFiles = new List<string>();
         uploaderMock.Setup(u => u.UploadFileAsync(It.IsAny<string>()))
+            .Callback<string>(path => uploadedFiles.Add(Path.GetFileName(path)))
             .Returns(Task.CompletedTask);
 
-        // Create sequential file: 1.txt
-        var testFilePath = Path.Combine(_testDir, "1.txt");
-        await File.WriteAllTextAsync(testFilePath, "content");
-
-        // Create 3.txt (Gap!)
-        var testFilePath3 = Path.Combine(_testDir, "3.txt");
-        await File.WriteAllTextAsync(testFilePath3, "content");
+        // Create files OUT OF ORDER on disk
+        // IDs: 5, 2, 10
+        await File.WriteAllTextAsync(Path.Combine(_testDir, "5.txt"), "content");
+        await File.WriteAllTextAsync(Path.Combine(_testDir, "2.txt"), "content");
+        await File.WriteAllTextAsync(Path.Combine(_testDir, "10.txt"), "content");
 
         using var worker = new Worker(loggerMock.Object, repoMock.Object, uploaderMock.Object, configuration);
 
         // Act
         var cts = new CancellationTokenSource();
-        // Start the worker
-        await worker.StartAsync(cts.Token);
+        var workerTask = worker.StartAsync(cts.Token);
 
-        // Wait a bit for scan and process to complete
-        await Task.Delay(3000);
+        // Wait for scan and process.
+        // 1st scan: should find 2, 5, 10. Process 2. Update maxId=2.
+        // 2nd scan: finds 5, 10. Process 5. Update maxId=5.
+        // 3rd scan: finds 10. Process 10. Update maxId=10.
+        // Wait sufficient time for 3 scans (interval is 1s, plus processing).
+        await Task.Delay(4000);
 
         // Stop
         await worker.StopAsync(CancellationToken.None);
 
         // Assert
-        // Verify Upload was called for 1.txt
-        uploaderMock.Verify(u => u.UploadFileAsync(testFilePath), Times.AtLeastOnce);
+        // We expect at least 3 files. It shouldn't process them AGAIN because maxId updates.
+        // Duplicate processing would only happen if maxId wasn't updated or file check failed.
 
-        // Verify Upload was called for 3.txt (should find it after skipping 2)
-        uploaderMock.Verify(u => u.UploadFileAsync(testFilePath3), Times.AtLeastOnce);
+        // Check order of FIRST 3 uploads.
+        Assert.True(uploadedFiles.Count >= 3, $"Expected at least 3 uploads, got {uploadedFiles.Count}");
+        Assert.Equal("2.txt", uploadedFiles[0]);
+        Assert.Equal("5.txt", uploadedFiles[1]);
+        Assert.Equal("10.txt", uploadedFiles[2]);
 
-        // Verify DB update for the file name 1.txt
-        repoMock.Verify(r => r.MarkFileProcessedAsync("1.txt", It.IsAny<long>(), "Processed"), Times.AtLeastOnce);
-
-        // Verify DB update for 3.txt
-        repoMock.Verify(r => r.MarkFileProcessedAsync("3.txt", It.IsAny<long>(), "Processed"), Times.AtLeastOnce);
+        // Ensure no duplicates were processed (count should be exactly 3)
+        Assert.Equal(3, uploadedFiles.Count);
     }
 }
