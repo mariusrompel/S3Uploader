@@ -6,7 +6,7 @@ using System.Threading.Channels;
 
 namespace FileUploaderService;
 
-public record FileItem(string FilePath, long FileId, long Size);
+public record FileItem(string FileName, long FileId, long Size);
 
 public class Worker : BackgroundService
 {
@@ -29,7 +29,7 @@ public class Worker : BackgroundService
         _sourceFolder = _configuration["SourceFolder"] ?? throw new ArgumentNullException("SourceFolder");
         _fileExtension = _configuration["FileExtension"] ?? ".wav";
         _concurrencyLimit = _configuration.GetValue<int>("ConcurrencyLimit", 5);
-        _scanIntervalSeconds = _configuration.GetValue<int>("ScanIntervalSeconds", 60); // Default 60s
+        _scanIntervalSeconds = _configuration.GetValue<int>("ScanIntervalSeconds", 60);
 
         // Ensure extension has dot
         if (!_fileExtension.StartsWith(".")) _fileExtension = "." + _fileExtension;
@@ -42,11 +42,13 @@ public class Worker : BackgroundService
         try
         {
             await _fileRepository.InitializeDatabaseAsync();
-            _logger.LogInformation("Database initialized.");
+            _logger.LogInformation("Database initialized and verified.");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to initialize database.");
+            _logger.LogError(ex, "Failed to initialize database (table missing?). Worker cannot proceed.");
+            // We stop the service if we can't find the table.
+            return;
         }
 
         var channel = Channel.CreateBounded<FileItem>(new BoundedChannelOptions(_concurrencyLimit * 2)
@@ -71,71 +73,54 @@ public class Worker : BackgroundService
                     continue;
                 }
 
-                _logger.LogInformation("Scanning source folder: {Folder}", _sourceFolder);
-
-                // Get the last processed ID to act as a high-water mark.
-                // We only care about files with ID > lastId.
-                long lastId = await _fileRepository.GetMaxProcessedIdAsync();
-
-                // Collect new files
-                var newFiles = new List<(long Id, string Path)>();
+                _logger.LogInformation("Fetching pending files from database...");
 
                 try
                 {
-                    // Enumerate all files matching the extension
-                    // This might take time for millions of files, but it's necessary to find the "lowest > lastId".
-                    var files = Directory.EnumerateFiles(_sourceFolder, "*" + _fileExtension);
+                    // Get a batch of pending files. Size = concurrency * 2 to keep pipeline full.
+                    var pendingFiles = await _fileRepository.GetPendingFilesAsync(_concurrencyLimit * 2);
 
-                    foreach (var filePath in files)
+                    int queuedCount = 0;
+                    foreach (var item in pendingFiles)
                     {
                         if (stoppingToken.IsCancellationRequested) break;
 
-                        var fileName = Path.GetFileName(filePath);
-                        // Parse ID from filename (assuming strict numeric format like "123.wav")
-                        var namePart = Path.GetFileNameWithoutExtension(fileName);
-                        if (long.TryParse(namePart, out var fileId))
+                        var fileName = item.FileName;
+                        var filePath = Path.Combine(_sourceFolder, fileName);
+
+                        if (File.Exists(filePath))
                         {
-                            if (fileId > lastId)
-                            {
-                                newFiles.Add((fileId, filePath));
-                            }
+                            var fileInfo = new FileInfo(filePath);
+                            // We push to channel.
+                            // Note: FileItem record structure changed slightly in previous steps but logic holds.
+                            // We reconstruct it with full info.
+                            await channel.Writer.WriteAsync(new FileItem(fileName, 0, fileInfo.Length), stoppingToken);
+                            queuedCount++;
                         }
+                        else
+                        {
+                            _logger.LogWarning("File listed in DB but not found on disk: {Path}", filePath);
+                            await _fileRepository.MarkFileFailedAsync(fileName, "File not found on disk");
+                        }
+                    }
+
+                    if (queuedCount == 0)
+                    {
+                        _logger.LogInformation("No pending files found. Waiting...");
+                        await Task.Delay(TimeSpan.FromSeconds(_scanIntervalSeconds), stoppingToken);
+                    }
+                    else
+                    {
+                         _logger.LogInformation("Queued {Count} files.", queuedCount);
+                         // If we found files, we loop immediately (or short delay) to keep processing unless queue is full.
+                         // The channel write blocks if full, so we naturally throttle.
                     }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error enumerating files.");
+                    _logger.LogError(ex, "Error fetching pending files.");
+                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
                 }
-
-                if (newFiles.Count > 0)
-                {
-                    // Sort by ID ascending to process "smallest number first"
-                    _logger.LogInformation("Found {Count} new files. Sorting...", newFiles.Count);
-                    newFiles.Sort((a, b) => a.Id.CompareTo(b.Id));
-
-                    // Process them in sorted order
-                    foreach (var (id, path) in newFiles)
-                    {
-                        if (stoppingToken.IsCancellationRequested) break;
-
-                        try
-                        {
-                            var fileInfo = new FileInfo(path);
-                            await channel.Writer.WriteAsync(new FileItem(path, id, fileInfo.Length), stoppingToken);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Error checking file info for {Path}", path);
-                        }
-                    }
-                }
-                else
-                {
-                    _logger.LogInformation("No new files found.");
-                }
-
-                // Wait before next scan. Ideally longer interval for large folders.
-                await Task.Delay(TimeSpan.FromSeconds(_scanIntervalSeconds), stoppingToken);
             }
         }
         catch (OperationCanceledException)
@@ -159,12 +144,14 @@ public class Worker : BackgroundService
         {
             await foreach (var item in reader.ReadAllAsync(stoppingToken))
             {
-                var fileName = Path.GetFileName(item.FilePath);
+                var fileName = item.FileName;
+                var filePath = Path.Combine(_sourceFolder, fileName);
+
                 try
                 {
-                    _logger.LogInformation("Processing file: {FileName} (ID: {Id})", fileName, item.FileId);
+                    _logger.LogInformation("Processing file: {FileName}", fileName);
 
-                    await _s3UploaderService.UploadFileAsync(item.FilePath);
+                    await _s3UploaderService.UploadFileAsync(filePath);
 
                     await _fileRepository.MarkFileProcessedAsync(fileName, item.Size, "Processed");
 
@@ -172,7 +159,8 @@ public class Worker : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to process file: {FileName}. Will retry on next scan.", fileName);
+                    _logger.LogError(ex, "Failed to process file: {FileName}.", fileName);
+                    await _fileRepository.MarkFileFailedAsync(fileName, ex.Message);
                 }
             }
         }
