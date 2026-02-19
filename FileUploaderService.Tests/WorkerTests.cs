@@ -32,7 +32,7 @@ public class WorkerTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_Should_Process_New_Files()
+    public async Task Worker_Should_Process_New_Files_Sequentially()
     {
         // Arrange
         var loggerMock = new Mock<ILogger<Worker>>();
@@ -41,7 +41,7 @@ public class WorkerTests : IDisposable
 
         var inMemorySettings = new Dictionary<string, string> {
             {"SourceFolder", _testDir},
-            {"FileExtension", ".txt"},
+            {"FileExtension", ".txt"}, // using .txt for test, but sequential check expects ID
             {"ConcurrencyLimit", "2"},
         };
 
@@ -50,10 +50,9 @@ public class WorkerTests : IDisposable
             .Build();
 
         // Setup Repo
-        // Instead of per-file check, we expect batch check.
-        // Return empty list => no files processed => process all.
-        repoMock.Setup(r => r.GetProcessedFileNamesAsync(It.IsAny<IEnumerable<string>>()))
-            .ReturnsAsync(new List<string>());
+        // Starting at ID 0, so next check is 1.txt
+        repoMock.Setup(r => r.GetMaxProcessedIdAsync())
+            .ReturnsAsync(0);
 
         repoMock.Setup(r => r.InitializeDatabaseAsync())
             .Returns(Task.CompletedTask);
@@ -64,9 +63,13 @@ public class WorkerTests : IDisposable
         uploaderMock.Setup(u => u.UploadFileAsync(It.IsAny<string>()))
             .Returns(Task.CompletedTask);
 
-        // Create a file
-        var testFilePath = Path.Combine(_testDir, "test.txt");
+        // Create sequential file: 1.txt
+        var testFilePath = Path.Combine(_testDir, "1.txt");
         await File.WriteAllTextAsync(testFilePath, "content");
+
+        // Create 3.txt (Gap!)
+        var testFilePath3 = Path.Combine(_testDir, "3.txt");
+        await File.WriteAllTextAsync(testFilePath3, "content");
 
         using var worker = new Worker(loggerMock.Object, repoMock.Object, uploaderMock.Object, configuration);
 
@@ -76,19 +79,22 @@ public class WorkerTests : IDisposable
         await worker.StartAsync(cts.Token);
 
         // Wait a bit for scan and process to complete
-        await Task.Delay(2000);
+        await Task.Delay(3000);
 
         // Stop
         await worker.StopAsync(CancellationToken.None);
 
         // Assert
-        // Verify Upload was called for the file path
+        // Verify Upload was called for 1.txt
         uploaderMock.Verify(u => u.UploadFileAsync(testFilePath), Times.AtLeastOnce);
 
-        // Verify DB update for the file name
-        repoMock.Verify(r => r.MarkFileProcessedAsync("test.txt", It.IsAny<long>(), "Processed"), Times.AtLeastOnce);
+        // Verify Upload was called for 3.txt (should find it after skipping 2)
+        uploaderMock.Verify(u => u.UploadFileAsync(testFilePath3), Times.AtLeastOnce);
 
-        // Verify batch check was called
-        repoMock.Verify(r => r.GetProcessedFileNamesAsync(It.IsAny<IEnumerable<string>>()), Times.AtLeastOnce);
+        // Verify DB update for the file name 1.txt
+        repoMock.Verify(r => r.MarkFileProcessedAsync("1.txt", It.IsAny<long>(), "Processed"), Times.AtLeastOnce);
+
+        // Verify DB update for 3.txt
+        repoMock.Verify(r => r.MarkFileProcessedAsync("3.txt", It.IsAny<long>(), "Processed"), Times.AtLeastOnce);
     }
 }

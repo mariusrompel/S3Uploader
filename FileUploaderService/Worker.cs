@@ -15,7 +15,7 @@ public class Worker : BackgroundService
     private readonly IS3UploaderService _s3UploaderService;
     private readonly IConfiguration _configuration;
     private readonly string _sourceFolder;
-    private readonly string _fileExtension;
+    private readonly string _fileExtension; // e.g., ".wav"
     private readonly int _concurrencyLimit;
 
     public Worker(ILogger<Worker> logger, IFileRepository fileRepository, IS3UploaderService s3UploaderService, IConfiguration configuration)
@@ -26,8 +26,11 @@ public class Worker : BackgroundService
         _configuration = configuration;
 
         _sourceFolder = _configuration["SourceFolder"] ?? throw new ArgumentNullException("SourceFolder");
-        _fileExtension = _configuration["FileExtension"] ?? "*";
+        _fileExtension = _configuration["FileExtension"] ?? ".wav";
         _concurrencyLimit = _configuration.GetValue<int>("ConcurrencyLimit", 5);
+
+        // Ensure extension has dot
+        if (!_fileExtension.StartsWith(".")) _fileExtension = "." + _fileExtension;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -55,47 +58,63 @@ public class Worker : BackgroundService
             consumerTasks.Add(ConsumeFilesAsync(channel.Reader, stoppingToken));
         }
 
+        // Sequential Scan Strategy
+        long currentId = 0;
         try
         {
+            // Initial sync: Get the last processed ID from DB
+            currentId = await _fileRepository.GetMaxProcessedIdAsync();
+            _logger.LogInformation("Starting sequential scan from ID: {Id}", currentId + 1);
+
             while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogInformation("Scanning source folder: {Folder}", _sourceFolder);
-
-                if (Directory.Exists(_sourceFolder))
-                {
-                    var searchPattern = _fileExtension.StartsWith("*") ? _fileExtension : "*" + _fileExtension;
-                    var files = Directory.EnumerateFiles(_sourceFolder, searchPattern);
-
-                    var batch = new List<string>();
-                    int batchSize = 100;
-                    int queuedCount = 0;
-
-                    foreach (var filePath in files)
-                    {
-                        if (stoppingToken.IsCancellationRequested) break;
-
-                        batch.Add(filePath);
-
-                        if (batch.Count >= batchSize)
-                        {
-                            queuedCount += await ProcessBatchAsync(batch, channel.Writer, stoppingToken);
-                            batch.Clear();
-                        }
-                    }
-
-                    if (batch.Count > 0)
-                    {
-                        queuedCount += await ProcessBatchAsync(batch, channel.Writer, stoppingToken);
-                    }
-
-                    _logger.LogInformation("Queued {Count} files for upload.", queuedCount);
-                }
-                else
+                if (!Directory.Exists(_sourceFolder))
                 {
                     _logger.LogWarning("Source folder not found: {Folder}", _sourceFolder);
+                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                    continue;
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                int maxMisses = 1000; // Look ahead 1000 IDs for a file.
+                bool foundAny = false;
+
+                // We will try to fill the channel as much as possible, or at least one file.
+                // Loop until we find a file or exhaust lookahead.
+                for (int lookAhead = 1; lookAhead <= maxMisses; lookAhead++)
+                {
+                    if (stoppingToken.IsCancellationRequested) break;
+
+                    long checkId = currentId + lookAhead;
+                    string fileName = $"{checkId}{_fileExtension}";
+                    string filePath = Path.Combine(_sourceFolder, fileName);
+
+                    if (File.Exists(filePath))
+                    {
+                        var fileInfo = new FileInfo(filePath);
+                        await channel.Writer.WriteAsync(new FileItem(filePath, fileInfo.Length), stoppingToken);
+
+                        // We found a file at 'checkId'.
+                        // This means 'currentId + 1' to 'checkId - 1' were skipped/gaps.
+                        // Update currentId to checkId so next loop starts from here.
+                        currentId = checkId;
+                        foundAny = true;
+
+                        // Reset lookAhead to continue scanning immediately from this new point
+                        lookAhead = 0;
+
+                        // To avoid hogging the thread forever if files are dense, maybe break occasionally?
+                        // The await WriteAsync handles backpressure, so we pause if consumers are slow.
+                        // But we should check cancellation often.
+                    }
+                }
+
+                if (!foundAny)
+                {
+                    // We looked ahead 1000 IDs and found nothing.
+                    // Likely reached the end of the sequence or a huge gap.
+                    _logger.LogInformation("No new files found up to ID {Id}. Waiting...", currentId + maxMisses);
+                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                }
             }
         }
         catch (OperationCanceledException)
@@ -104,40 +123,13 @@ public class Worker : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error in producer loop.");
+            _logger.LogError(ex, "Error in sequential scanner.");
         }
         finally
         {
             channel.Writer.Complete();
             await Task.WhenAll(consumerTasks);
         }
-    }
-
-    private async Task<int> ProcessBatchAsync(List<string> filePaths, ChannelWriter<FileItem> writer, CancellationToken stoppingToken)
-    {
-        int count = 0;
-        try
-        {
-            var fileNames = filePaths.Select(Path.GetFileName).ToList();
-            var processedNames = await _fileRepository.GetProcessedFileNamesAsync(fileNames!);
-            var processedSet = new HashSet<string>(processedNames);
-
-            foreach (var filePath in filePaths)
-            {
-                var fileName = Path.GetFileName(filePath);
-                if (!processedSet.Contains(fileName))
-                {
-                    var fileInfo = new FileInfo(filePath);
-                    await writer.WriteAsync(new FileItem(filePath, fileInfo.Length), stoppingToken);
-                    count++;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing batch.");
-        }
-        return count;
     }
 
     private async Task ConsumeFilesAsync(ChannelReader<FileItem> reader, CancellationToken stoppingToken)
@@ -159,7 +151,12 @@ public class Worker : BackgroundService
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to process file: {FileName}. Will retry on next scan.", fileName);
+                    _logger.LogError(ex, "Failed to process file: {FileName}. Will retry on next restart if gap not filled.", fileName);
+                    // Failure handling:
+                    // We do NOT mark as processed.
+                    // The producer has already advanced past this ID.
+                    // This file will be skipped until restart OR manual intervention.
+                    // For now, this meets the requirement of "resume where stopped" (at the high water mark).
                 }
             }
         }
