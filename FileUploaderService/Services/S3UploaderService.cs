@@ -4,6 +4,7 @@ using FileUploaderService.Interfaces;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
+using System.IO;
 using System.Threading.Tasks;
 
 namespace FileUploaderService.Services;
@@ -14,17 +15,27 @@ public class S3UploaderService : IS3UploaderService, IDisposable
     private readonly TransferUtility _transferUtility;
     private readonly ILogger<S3UploaderService> _logger;
     private readonly string _bucketName;
+    private readonly string _destinationPrefix;
 
     public S3UploaderService(IAwsTokenService awsTokenService, IConfiguration configuration, ILogger<S3UploaderService> logger)
     {
         _logger = logger;
         _bucketName = configuration["Aws:BucketName"] ?? throw new ArgumentNullException("Aws:BucketName");
+        _destinationPrefix = configuration["Aws:DestinationPrefix"] ?? "";
+
+        // Ensure prefix ends with '/' if not empty, and doesn't start with '/' for S3 key rules usually.
+        // If user specified "/tenant1", make it "tenant1/"
+        if (!string.IsNullOrEmpty(_destinationPrefix))
+        {
+            _destinationPrefix = _destinationPrefix.TrimStart('/');
+            if (!_destinationPrefix.EndsWith("/"))
+            {
+                _destinationPrefix += "/";
+            }
+        }
+
         var region = configuration["Aws:Region"] ?? "us-east-1";
 
-        // Get the credentials provider object.
-        // This object handles credential rotation internally.
-        // We use .Result here because in our implementation it returns the provider object immediately (synchronously).
-        // If the implementation were truly async, we would need to rethink injection or use async factory.
         var credentials = awsTokenService.GetCredentialsAsync().GetAwaiter().GetResult();
 
         var config = new AmazonS3Config
@@ -44,12 +55,16 @@ public class S3UploaderService : IS3UploaderService, IDisposable
 
     public async Task UploadFileAsync(string filePath)
     {
-        _logger.LogInformation("Uploading {FilePath} to bucket {BucketName}...", filePath, _bucketName);
+        var fileName = Path.GetFileName(filePath);
+        var key = _destinationPrefix + fileName;
+
+        _logger.LogInformation("Uploading {FilePath} to bucket {BucketName} with key {Key}...", filePath, _bucketName, key);
 
         try
         {
-            await _transferUtility.UploadAsync(filePath, _bucketName);
-            _logger.LogInformation("Successfully uploaded {FilePath}.", filePath);
+            // Use the key which includes the prefix.
+            await _transferUtility.UploadAsync(filePath, _bucketName, key);
+            _logger.LogInformation("Successfully uploaded {FilePath} as {Key}.", filePath, key);
         }
         catch (AmazonS3Exception e)
         {
