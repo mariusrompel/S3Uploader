@@ -1,4 +1,5 @@
 using Amazon.S3;
+using Amazon.S3.Model;
 using Amazon.S3.Transfer;
 using FileUploaderService.Interfaces;
 using Microsoft.Extensions.Configuration;
@@ -16,6 +17,7 @@ public class S3UploaderService : IS3UploaderService, IDisposable
     private readonly ILogger<S3UploaderService> _logger;
     private readonly string _bucketName;
     private readonly string _destinationPrefix;
+    private readonly long _multipartThreshold = 5 * 1024 * 1024; // 5 MB threshold for simple PutObject
 
     public S3UploaderService(IAwsTokenService awsTokenService, IConfiguration configuration, ILogger<S3UploaderService> logger)
     {
@@ -23,8 +25,6 @@ public class S3UploaderService : IS3UploaderService, IDisposable
         _bucketName = configuration["Aws:BucketName"] ?? throw new ArgumentNullException("Aws:BucketName");
         _destinationPrefix = configuration["Aws:DestinationPrefix"] ?? "";
 
-        // Ensure prefix ends with '/' if not empty, and doesn't start with '/' for S3 key rules usually.
-        // If user specified "/tenant1", make it "tenant1/"
         if (!string.IsNullOrEmpty(_destinationPrefix))
         {
             _destinationPrefix = _destinationPrefix.TrimStart('/');
@@ -40,7 +40,11 @@ public class S3UploaderService : IS3UploaderService, IDisposable
 
         var config = new AmazonS3Config
         {
-            RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(region)
+            RegionEndpoint = Amazon.RegionEndpoint.GetBySystemName(region),
+            MaxErrorRetry = 3,
+            // Increase concurrent connections to handle high concurrency (e.g. 50 threads)
+            // .NET Core usually handles this automatically, but explicit setting can help.
+            // Timeout settings can also be tweaked if needed.
         };
 
         _s3Client = new AmazonS3Client(credentials, config);
@@ -57,14 +61,33 @@ public class S3UploaderService : IS3UploaderService, IDisposable
     {
         var fileName = Path.GetFileName(filePath);
         var key = _destinationPrefix + fileName;
+        var fileInfo = new FileInfo(filePath);
 
-        _logger.LogInformation("Uploading {FilePath} to bucket {BucketName} with key {Key}...", filePath, _bucketName, key);
+        _logger.LogInformation("Uploading {FilePath} to bucket {BucketName} with key {Key} (Size: {Size})...", filePath, _bucketName, key, fileInfo.Length);
 
         try
         {
-            // Use the key which includes the prefix.
-            await _transferUtility.UploadAsync(filePath, _bucketName, key);
-            _logger.LogInformation("Successfully uploaded {FilePath} as {Key}.", filePath, key);
+            // Optimization: Use PutObjectAsync for small files to avoid TransferUtility overhead (multipart checks, etc.)
+            // The user mentioned GSM files which are small.
+            if (fileInfo.Length < _multipartThreshold)
+            {
+                var putRequest = new PutObjectRequest
+                {
+                    BucketName = _bucketName,
+                    Key = key,
+                    FilePath = filePath,
+                    DisablePayloadSigning = false // Keep default security
+                };
+
+                await _s3Client.PutObjectAsync(putRequest);
+            }
+            else
+            {
+                // Use TransferUtility for larger files (it handles multipart automatically)
+                await _transferUtility.UploadAsync(filePath, _bucketName, key);
+            }
+
+            _logger.LogInformation("Successfully uploaded {FilePath}.", filePath);
         }
         catch (AmazonS3Exception e)
         {
