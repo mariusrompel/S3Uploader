@@ -3,9 +3,15 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Threading.Channels;
+using System.IO;
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace FileUploaderService;
 
+// 'FileName' here represents the full path as stored in the database.
 public record FileItem(string FileName, long FileId, long Size);
 
 public class Worker : BackgroundService
@@ -14,8 +20,6 @@ public class Worker : BackgroundService
     private readonly IFileRepository _fileRepository;
     private readonly IS3UploaderService _s3UploaderService;
     private readonly IConfiguration _configuration;
-    private readonly string _sourceFolder;
-    private readonly string _fileExtension; // e.g., ".wav"
     private readonly int _concurrencyLimit;
     private readonly int _scanIntervalSeconds;
 
@@ -26,13 +30,8 @@ public class Worker : BackgroundService
         _s3UploaderService = s3UploaderService;
         _configuration = configuration;
 
-        _sourceFolder = _configuration["SourceFolder"] ?? throw new ArgumentNullException("SourceFolder");
-        _fileExtension = _configuration["FileExtension"] ?? ".wav";
         _concurrencyLimit = _configuration.GetValue<int>("ConcurrencyLimit", 5);
         _scanIntervalSeconds = _configuration.GetValue<int>("ScanIntervalSeconds", 60);
-
-        // Ensure extension has dot
-        if (!_fileExtension.StartsWith(".")) _fileExtension = "." + _fileExtension;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,7 +46,6 @@ public class Worker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to initialize database (table missing?). Worker cannot proceed.");
-            // We stop the service if we can't find the table.
             return;
         }
 
@@ -66,13 +64,6 @@ public class Worker : BackgroundService
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                if (!Directory.Exists(_sourceFolder))
-                {
-                    _logger.LogWarning("Source folder not found: {Folder}", _sourceFolder);
-                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
-                    continue;
-                }
-
                 _logger.LogInformation("Fetching pending files from database...");
 
                 try
@@ -85,22 +76,20 @@ public class Worker : BackgroundService
                     {
                         if (stoppingToken.IsCancellationRequested) break;
 
-                        var fileName = item.FileName;
-                        var filePath = Path.Combine(_sourceFolder, fileName);
+                        // The 'FileName' from the database is expected to be the full file path.
+                        var fullFilePath = item.FileName;
 
-                        if (File.Exists(filePath))
+                        if (File.Exists(fullFilePath))
                         {
-                            var fileInfo = new FileInfo(filePath);
-                            // We push to channel.
-                            // Note: FileItem record structure changed slightly in previous steps but logic holds.
-                            // We reconstruct it with full info.
-                            await channel.Writer.WriteAsync(new FileItem(fileName, 0, fileInfo.Length), stoppingToken);
+                            var fileInfo = new FileInfo(fullFilePath);
+                            // Push the full path to the channel so the consumer can upload it.
+                            await channel.Writer.WriteAsync(new FileItem(fullFilePath, 0, fileInfo.Length), stoppingToken);
                             queuedCount++;
                         }
                         else
                         {
-                            _logger.LogWarning("File listed in DB but not found on disk: {Path}", filePath);
-                            await _fileRepository.MarkFileFailedAsync(fileName, "File not found on disk");
+                            _logger.LogWarning("File listed in DB but not found on disk: {Path}", fullFilePath);
+                            await _fileRepository.MarkFileFailedAsync(fullFilePath, "File not found on disk");
                         }
                     }
 
@@ -112,8 +101,7 @@ public class Worker : BackgroundService
                     else
                     {
                          _logger.LogInformation("Queued {Count} files.", queuedCount);
-                         // If we found files, we loop immediately (or short delay) to keep processing unless queue is full.
-                         // The channel write blocks if full, so we naturally throttle.
+                         // Yield slightly if needed, but bounded channel handles backpressure.
                     }
                 }
                 catch (Exception ex)
@@ -144,29 +132,31 @@ public class Worker : BackgroundService
         {
             await foreach (var item in reader.ReadAllAsync(stoppingToken))
             {
-                var fileName = item.FileName;
-                var filePath = Path.Combine(_sourceFolder, fileName);
+                var fullFilePath = item.FileName;
 
                 try
                 {
-                    _logger.LogInformation("Processing file: {FileName}", fileName);
+                    _logger.LogInformation("Processing file: {FilePath}", fullFilePath);
 
-                    await _s3UploaderService.UploadFileAsync(filePath);
+                    // Uploads the file to S3.
+                    // Note: S3UploaderService extracts Path.GetFileName(fullFilePath) to construct the S3 Object Key.
+                    await _s3UploaderService.UploadFileAsync(fullFilePath);
 
-                    await _fileRepository.MarkFileProcessedAsync(fileName, item.Size, "Processed");
+                    // Updates the database using the full path as the identifier.
+                    await _fileRepository.MarkFileProcessedAsync(fullFilePath, item.Size, "Processed");
 
-                    _logger.LogInformation("File processed and tracked: {FileName}", fileName);
+                    _logger.LogInformation("File processed and tracked: {FilePath}", fullFilePath);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to process file: {FileName}.", fileName);
-                    await _fileRepository.MarkFileFailedAsync(fileName, ex.Message);
+                    _logger.LogError(ex, "Failed to process file: {FilePath}.", fullFilePath);
+                    await _fileRepository.MarkFileFailedAsync(fullFilePath, ex.Message);
                 }
             }
         }
         catch (OperationCanceledException)
         {
-            // Expected
+            // Expected on shutdown
         }
         catch (Exception ex)
         {

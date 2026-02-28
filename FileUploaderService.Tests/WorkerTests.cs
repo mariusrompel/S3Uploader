@@ -32,7 +32,7 @@ public class WorkerTests : IDisposable
     }
 
     [Fact]
-    public async Task Worker_Should_Process_Files_From_Database_Queue()
+    public async Task Worker_Should_Process_Files_From_Database_Using_Full_Path()
     {
         // Arrange
         var loggerMock = new Mock<ILogger<Worker>>();
@@ -40,8 +40,6 @@ public class WorkerTests : IDisposable
         var uploaderMock = new Mock<IS3UploaderService>();
 
         var inMemorySettings = new Dictionary<string, string> {
-            {"SourceFolder", _testDir},
-            {"FileExtension", ".txt"},
             {"ConcurrencyLimit", "1"},
             {"ScanIntervalSeconds", "1"}
         };
@@ -50,14 +48,14 @@ public class WorkerTests : IDisposable
             .AddInMemoryCollection(inMemorySettings)
             .Build();
 
-        // Setup Repo
-        // We simulate a database queue: 1.txt, 2.txt
-        // 1st call returns [1.txt, 2.txt]
-        // 2nd call returns empty (assuming processed)
+        // Create full paths for testing
+        var file1Path = Path.Combine(_testDir, "1.txt");
+        var file2Path = Path.Combine(_testDir, "2.txt");
 
+        // We simulate a database queue returning full paths
         var pendingFiles = new Queue<FileItem>();
-        pendingFiles.Enqueue(new FileItem("1.txt", 0, 0));
-        pendingFiles.Enqueue(new FileItem("2.txt", 0, 0));
+        pendingFiles.Enqueue(new FileItem(file1Path, 0, 0));
+        pendingFiles.Enqueue(new FileItem(file2Path, 0, 0));
 
         repoMock.Setup(r => r.GetPendingFilesAsync(It.IsAny<int>()))
             .ReturnsAsync((int batch) => {
@@ -77,12 +75,12 @@ public class WorkerTests : IDisposable
 
         var uploadedFiles = new List<string>();
         uploaderMock.Setup(u => u.UploadFileAsync(It.IsAny<string>()))
-            .Callback<string>(path => uploadedFiles.Add(Path.GetFileName(path)))
+            .Callback<string>(path => uploadedFiles.Add(path))
             .Returns(Task.CompletedTask);
 
-        // Create files on disk
-        await File.WriteAllTextAsync(Path.Combine(_testDir, "1.txt"), "content");
-        await File.WriteAllTextAsync(Path.Combine(_testDir, "2.txt"), "content");
+        // Create files on disk using the full paths
+        await File.WriteAllTextAsync(file1Path, "content");
+        await File.WriteAllTextAsync(file2Path, "content");
 
         using var worker = new Worker(loggerMock.Object, repoMock.Object, uploaderMock.Object, configuration);
 
@@ -99,11 +97,13 @@ public class WorkerTests : IDisposable
 
         // Assert
         Assert.Equal(2, uploadedFiles.Count);
-        Assert.Contains("1.txt", uploadedFiles);
-        Assert.Contains("2.txt", uploadedFiles);
 
-        // Verify DB updates
-        repoMock.Verify(r => r.MarkFileProcessedAsync("1.txt", It.IsAny<long>(), "Processed"), Times.Once);
-        repoMock.Verify(r => r.MarkFileProcessedAsync("2.txt", It.IsAny<long>(), "Processed"), Times.Once);
+        // Ensure the full path was passed to the S3 uploader
+        Assert.Contains(file1Path, uploadedFiles);
+        Assert.Contains(file2Path, uploadedFiles);
+
+        // Verify DB updates use the full path
+        repoMock.Verify(r => r.MarkFileProcessedAsync(file1Path, It.IsAny<long>(), "Processed"), Times.Once);
+        repoMock.Verify(r => r.MarkFileProcessedAsync(file2Path, It.IsAny<long>(), "Processed"), Times.Once);
     }
 }
