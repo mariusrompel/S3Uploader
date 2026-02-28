@@ -48,6 +48,7 @@ public class FileRepository : IFileRepository
                 ALTER TABLE {_tableName} ADD ErrorMessage NVARCHAR(MAX);
 
             -- Important indexes to prevent scans and deadlocks
+            -- Creating indexes on large tables takes time. We will use commandTimeout: 0 (infinite).
             IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_{_tableName}_Status' AND object_id = OBJECT_ID('{_tableName}'))
                 CREATE INDEX IX_{_tableName}_Status ON {_tableName}(Status);
 
@@ -55,7 +56,8 @@ public class FileRepository : IFileRepository
                 CREATE INDEX IX_{_tableName}_FileName ON {_tableName}(FileName);
         ";
 
-        await connection.ExecuteAsync(ensureColumnsSql);
+        // Execute schema changes and indexing with no timeout (0), as it might take minutes on a table with millions of rows.
+        await connection.ExecuteAsync(ensureColumnsSql, commandTimeout: 0);
     }
 
     public async Task<IEnumerable<FileItem>> GetPendingFilesAsync(int batchSize)
@@ -63,9 +65,7 @@ public class FileRepository : IFileRepository
         using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync();
 
-        // Use WITH (READPAST) to skip locked rows if any, preventing reader-writer blocking.
-        // Though purely read operations usually don't block unless using isolation levels,
-        // READPAST ensures we don't wait on row locks held by concurrent updates.
+        // Use WITH (READPAST) to skip locked rows
         var sql = $"SELECT TOP (@BatchSize) FileName FROM {_tableName} WITH (READPAST) WHERE Status IS NULL OR Status NOT IN ('Processed', 'Error')";
 
         var fileNames = await connection.QueryAsync<string>(sql, new { BatchSize = batchSize });
